@@ -1,0 +1,135 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-matrix:
+    name: Define build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      is_found: ${{ steps.set-matrix.outputs.is_found }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+          persist-credentials: false
+      - name: Get changed Dockerfiles
+        if: github.event_name == 'pull_request'
+        id: changed-files
+        uses: tj-actions/changed-files@e0021407031f5be11a464abee9a0776171c79891 # v47.0.1
+        with:
+          files: "**/Dockerfile"
+          separator: "\n"
+      - name: Get all Dockerfiles
+        if: github.event_name != 'pull_request'
+        id: files
+        run: |
+          files=$(find . -type f -name 'Dockerfile')
+          # For multi-line outputs, we need to use the special syntax
+          # ref: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#multiline-strings
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          #!/bin/bash
+          matrix='[]'
+          is_found=false
+          if [[ -n "$FILES" ]]; then
+            # Generate json suitable for matrix, e.g.:
+            # '[{"file": "one/Dockerfile", "path": "one", "name": "one"},{"file": "foo/bar/Dockerfile", "path": "foo/bar", "name": "bar"}]'
+            matrix=$(echo "$FILES" | jq -R -s -c 'split("\n")[:-1] | map({file: ., path: (. | split("/")[:-1] | join("/")), name: (. | split("/")[-2])})')
+            is_found=true
+          fi
+          echo "matrix=$matrix" | tee -a $GITHUB_OUTPUT
+          echo "is_found=$is_found" | tee -a $GITHUB_OUTPUT
+        env:
+          FILES: ${{ steps.changed-files.outputs.all_changed_files || steps.files.outputs.files }}
+        shell: bash
+
+  build:
+    name: Build ${{ matrix.dockerfile.name }}
+    needs: build-matrix
+    if: ${{ needs.build-matrix.outputs.is_found == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dockerfile: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+      fail-fast: false
+    env:
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          flavor: |
+            suffix=-${{ matrix.dockerfile.name }},onlatest=true
+          images: |
+            ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build and export to Docker
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ matrix.dockerfile.path }}
+          file: ${{ matrix.dockerfile.file }}
+          load: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ steps.build.outputs.imageid }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.ACTIONS_BOT_TOKEN }}
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_LOGIN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ matrix.dockerfile.path }}
+          file: ${{ matrix.dockerfile.file }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+          DOCKER_BUILD_CHECKS_ANNOTATIONS: false
